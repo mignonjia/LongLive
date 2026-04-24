@@ -37,7 +37,10 @@ from pipeline import (
     SwitchCausalInferencePipeline
 )
 from utils.debug_option import DEBUG, LOG_GPU_MEMORY, DEBUG_GRADIENT
-from one_logger_utils import OneLoggerUtils
+try:
+    from one_logger_utils import OneLoggerUtils
+except ImportError:
+    OneLoggerUtils = None
 import time
 
 class Trainer:
@@ -69,6 +72,7 @@ class Trainer:
         set_seed(config.seed + global_rank)
 
         self.use_one_logger = getattr(config, "use_one_logger", True)
+        self.wandb_run_id = None
         if self.is_main_process and not self.disable_wandb:
             wandb.login(
                 # host=config.wandb_host,
@@ -81,12 +85,37 @@ class Trainer:
                 project=config.wandb_project,
                 dir=config.wandb_save_dir
             )
+            if wandb.run is not None:
+                self.wandb_run_id = wandb.run.id
+
+        vis_run_id = self.wandb_run_id
+        if dist.is_initialized():
+            vis_run_id_list = [vis_run_id if self.is_main_process else None]
+            dist.broadcast_object_list(vis_run_id_list, src=0)
+            vis_run_id = vis_run_id_list[0]
+        if not vis_run_id:
+            vis_run_id = getattr(config, "config_name", "run")
+        self.vis_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(vis_run_id)).strip("._") or "run"
 
         self.output_path = config.logdir
         app_start_time = time.time_ns() / 1_000_000 
+
+        self.generator_update_gap_choices = getattr(config, "generator_update_gap_choices", None)
+        if self.generator_update_gap_choices is not None:
+            self.generator_update_gap_choices = [int(x) for x in self.generator_update_gap_choices]
+            if len(self.generator_update_gap_choices) == 0:
+                raise ValueError("generator_update_gap_choices is empty")
+            if any(x < 0 for x in self.generator_update_gap_choices):
+                raise ValueError("generator_update_gap_choices must contain non-negative integers")
+            self.next_generator_step = int(self.step)
+        else:
+            self.next_generator_step = None
         
         # ------------------------------------- One Logger Setup ----------------------------------------------
-        if self.use_one_logger and dist.get_rank() == 0 and not self.disable_wandb:
+        if self.use_one_logger and OneLoggerUtils is None and dist.get_rank() == 0:
+            logging.warning("one_logger_utils is not installed; disabling One Logger.")
+
+        if self.use_one_logger and OneLoggerUtils is not None and dist.get_rank() == 0 and not self.disable_wandb:
             app_tag_run_name = f"dmd_{config.real_name[:6]}_local_attn_size_{config.model_kwargs.local_attn_size}_lr_{config.lr}"
             app_tag_run_version = "0.0.0"
             app_tag = f"{app_tag_run_name}_{app_tag_run_version}_{config.batch_size}_{dist.get_world_size()}"
@@ -737,6 +766,54 @@ class Trainer:
             raise ValueError(f"Invalid switch_mode: {getattr(self.config, 'switch_mode', 'fixed')}")
         return switch_idx
 
+    def _get_streaming_max_length_for_step(self):
+        schedule = getattr(self.config, "streaming_max_length_schedule", None)
+        if not schedule:
+            return None
+
+        current_step = int(self.step)
+        for stage in schedule:
+            start_step = int(stage.get("start_step", 0))
+            end_step = stage.get("end_step", None)
+            max_length = int(stage["max_length"])
+            if end_step is None:
+                if current_step >= start_step:
+                    return max_length
+            else:
+                end_step = int(end_step)
+                if start_step <= current_step < end_step:
+                    return max_length
+
+        return int(schedule[-1]["max_length"])
+
+    def _should_train_generator(self):
+        if self.generator_update_gap_choices is None:
+            return self.step % self.config.dfake_gen_update_ratio == 0
+        return int(self.step) == int(self.next_generator_step)
+
+    def _update_next_generator_step(self):
+        if self.generator_update_gap_choices is None:
+            return
+
+        if dist.is_initialized():
+            if dist.get_rank() == 0:
+                selected_gap = random.choice(self.generator_update_gap_choices)
+            else:
+                selected_gap = 0
+            selected_gap_tensor = torch.tensor(selected_gap, device=self.device, dtype=torch.int32)
+            dist.broadcast(selected_gap_tensor, src=0)
+            selected_gap = int(selected_gap_tensor.item())
+        else:
+            selected_gap = random.choice(self.generator_update_gap_choices)
+
+        self.next_generator_step = int(self.step) + selected_gap + 1
+
+        if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+            print(
+                f"[SeqTrain-Trainer] generator gap sampled={selected_gap}, "
+                f"next_generator_step={self.next_generator_step}"
+            )
+
 
     def save(self):
         print("Start gathering distributed model states...")
@@ -990,7 +1067,10 @@ class Trainer:
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
             log_gpu_memory(f"streaming Training: After text encoding", device=self.device, rank=dist.get_rank())
         
-        if self.streaming_model.possible_max_length is not None:
+        scheduled_max_length = self._get_streaming_max_length_for_step()
+        if scheduled_max_length is not None:
+            temp_max_length = scheduled_max_length
+        elif self.streaming_model.possible_max_length is not None:
             # Ensure all processes choose the same length
             if dist.is_initialized():
                 if dist.get_rank() == 0:
@@ -1053,6 +1133,39 @@ class Trainer:
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
             log_gpu_memory(f"streaming Training: After sequence setup", device=self.device, rank=dist.get_rank())
 
+    def _prepare_streaming_sequence(self):
+        if not self.streaming_active:
+            if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+                print(f"[SeqTrain-Trainer] No active sequence, starting new one")
+            self.start_new_sequence()
+
+        if not self.streaming_model.can_generate_more():
+            if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+                print(f"[SeqTrain-Trainer] Current sequence completed, starting new one")
+            self.streaming_active = False
+            self.start_new_sequence()
+
+    def _generate_streaming_generator_chunk(self, requires_grad: bool):
+        train_first_chunk = getattr(self.config, "train_first_chunk", False)
+        if train_first_chunk:
+            return self.streaming_model.generate_next_chunk(requires_grad=requires_grad)
+
+        current_seq_length = self.streaming_model.state.get("current_length")
+        if current_seq_length == 0:
+            if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+                print(
+                    f"[SeqTrain-Trainer] train_first_chunk={train_first_chunk}, "
+                    f"current_seq_length={current_seq_length}, generate first chunk"
+                )
+            self.streaming_model.generate_next_chunk(requires_grad=False)
+
+        generated_chunk, chunk_info = self.streaming_model.generate_next_chunk(requires_grad=requires_grad)
+
+        if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+            print(f"[SeqTrain-Trainer] train_first_chunk={train_first_chunk}, current_seq_length={current_seq_length}")
+
+        return generated_chunk, chunk_info
+
     def fwdbwd_one_step_streaming(self, train_generator):
         """Forward/backward pass using the new StreamingTrainingModel for serialized training"""
         self.model.eval()  # prevent any randomness (e.g. dropout)
@@ -1060,19 +1173,7 @@ class Trainer:
         if self.step % 5 == 0:
             torch.cuda.empty_cache()
 
-        # If no active sequence, start a new one
-        if not self.streaming_active:
-            if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
-                print(f"[SeqTrain-Trainer] No active sequence, starting new one")
-            self.start_new_sequence()
-        
-        # Check whether we can generate more chunks
-        if not self.streaming_model.can_generate_more():
-            # Current sequence is finished; start a new one
-            if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
-                print(f"[SeqTrain-Trainer] Current sequence completed, starting new one")
-            self.streaming_active = False
-            self.start_new_sequence()
+        self._prepare_streaming_sequence()
         
         self.kv_cache_before_generator_rollout = None
         self.kv_cache_after_generator_rollout = None
@@ -1085,26 +1186,33 @@ class Trainer:
             if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                 print(f"[SeqTrain-Trainer] Training generator: generating next chunk")
 
-            train_first_chunk = getattr(self.config, "train_first_chunk", False)
-            if train_first_chunk:
-                generated_chunk, chunk_info = self.streaming_model.generate_next_chunk(requires_grad=True)
-            else:
-                current_seq_length = self.streaming_model.state.get("current_length")
-                if current_seq_length == 0:
+            num_generator_chunks = int(getattr(self.config, "streaming_generator_loss_chunks", 1))
+            generator_losses = []
+            generator_log_dicts = []
+
+            for chunk_idx in range(num_generator_chunks):
+                if chunk_idx > 0 and not self.streaming_model.can_generate_more():
                     if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
-                        print(f"[SeqTrain-Trainer] train_first_chunk={train_first_chunk}, current_seq_length={current_seq_length}, generate first chunk")
-                    generated_chunk, chunk_info = self.streaming_model.generate_next_chunk(requires_grad=False)
+                        print(
+                            f"[SeqTrain-Trainer] Stopping generator chunk collection early at "
+                            f"{chunk_idx}/{num_generator_chunks} because the current sequence ended"
+                        )
+                    break
 
-                generated_chunk, chunk_info = self.streaming_model.generate_next_chunk(requires_grad=True)
-            
-                if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
-                    print(f"[SeqTrain-Trainer] train_first_chunk={train_first_chunk}, current_seq_length={current_seq_length}")
+                generated_chunk, chunk_info = self._generate_streaming_generator_chunk(requires_grad=True)
 
-            # Compute generator loss
-            generator_loss, generator_log_dict = self.streaming_model.compute_generator_loss(
-                chunk=generated_chunk,
-                chunk_info=chunk_info
-            )
+                generator_loss, generator_log_dict = self.streaming_model.compute_generator_loss(
+                    chunk=generated_chunk,
+                    chunk_info=chunk_info
+                )
+                generator_losses.append(generator_loss)
+                generator_log_dicts.append(generator_log_dict)
+
+            if len(generator_losses) == 0:
+                raise RuntimeError("No generator chunks were collected for streaming generator loss")
+
+            generator_loss = torch.stack(generator_losses).mean()
+            generator_log_dict = merge_dict_list(generator_log_dicts)
 
             # Scale loss for gradient accumulation and backward
             scaled_generator_loss = generator_loss / self.gradient_accumulation_steps
@@ -1135,7 +1243,7 @@ class Trainer:
                 if current_seq_length == 0:
                     if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                         print(f"[SeqTrain-Trainer] train_first_chunk={train_first_chunk}, current_seq_length={current_seq_length}, generate first chunk")
-                    generated_chunk, chunk_info = self.streaming_model.generate_next_chunk(requires_grad=False)
+                    self.streaming_model.generate_next_chunk(requires_grad=False)
 
                 generated_chunk, chunk_info = self.streaming_model.generate_next_chunk(requires_grad=False)
             
@@ -1172,9 +1280,12 @@ class Trainer:
     def train(self):
         start_step = self.step
         try:
+            if self.vis_interval > 0:
+                self._maybe_visualize()
+
             while True:
                 # Check if we should train generator on this optimization step
-                TRAIN_GENERATOR = self.step % self.config.dfake_gen_update_ratio == 0
+                TRAIN_GENERATOR = self._should_train_generator()
                 if LOG_GPU_MEMORY:
                     log_gpu_memory(f"Before training", device=self.device, rank=dist.get_rank())
                 
@@ -1246,6 +1357,8 @@ class Trainer:
                     
                     # Increase step count
                     self.step += 1
+                    if TRAIN_GENERATOR:
+                        self._update_next_generator_step()
                     
                     if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                         print(f"[SeqTrain-Trainer] streaming training step completed: step={self.step}")
@@ -1296,6 +1409,8 @@ class Trainer:
 
                     # Increment the step since we finished gradient update
                     self.step += 1
+                    if TRAIN_GENERATOR:
+                        self._update_next_generator_step()
 
                 if self.one_logger is not None:
                     self.one_logger.on_train_batch_end()
@@ -1360,16 +1475,7 @@ class Trainer:
                 # ---------------------------------------- Visualization ---------------------------------------------------
 
                 if self.vis_interval > 0 and (self.step % self.vis_interval == 0):
-                    if self.one_logger is not None:
-                        self.one_logger.on_validation_start()
-
-                    try:
-                        self._visualize()
-                    except Exception as e:
-                        print(f"[Warning] Visualization failed at step {self.step}: {e}")
-                
-                    if self.one_logger is not None:
-                        self.one_logger.on_validation_end()
+                    self._maybe_visualize()
                 
                 if self.step > self.config.max_iters:
                     break
@@ -1393,6 +1499,22 @@ class Trainer:
                 except Exception as cleanup_e:
                     if self.is_main_process:
                         print(f"[WARNING] Failed to clean up one_logger: {cleanup_e}")
+
+
+    def _maybe_visualize(self):
+        if self.vis_interval <= 0:
+            return
+
+        if self.one_logger is not None:
+            self.one_logger.on_validation_start()
+
+        try:
+            self._visualize()
+        except Exception as e:
+            print(f"[Warning] Visualization failed at step {self.step}: {e}")
+
+        if self.one_logger is not None:
+            self.one_logger.on_validation_end()
 
 
     def _configure_lora_for_model(self, transformer, model_name):
@@ -1478,8 +1600,8 @@ class Trainer:
                 text_encoder=self.model.text_encoder,
                 vae=self.model.vae)
 
-        # Visualization output directory (default: <logdir>/vis)
-        self.vis_output_dir = os.path.join(os.path.dirname(self.output_path), "vis")
+        # Keep visualizations isolated per wandb run to avoid logging stale videos.
+        self.vis_output_dir = os.path.join("vis", self.vis_run_id)
         os.makedirs(self.vis_output_dir, exist_ok=True)
         if self.config.vis_ema:
             raise NotImplementedError("Visualization with EMA is not implemented")
@@ -1537,6 +1659,25 @@ class Trainer:
                 )
                 video_tensor = torch.from_numpy(video_np.astype("uint8"))
                 write_video(out_path, video_tensor, fps=16)
+
+            if dist.is_initialized():
+                dist.barrier()
+
+            if self.is_main_process and not self.disable_wandb:
+                video_files = sorted(
+                    os.path.join(step_vis_dir, name)
+                    for name in os.listdir(step_vis_dir)
+                    if name.endswith(".mp4") and f"_len_{vid_len}" in name
+                )
+                video_logs = [
+                    wandb.Video(path, fps=16, format="mp4")
+                    for path in video_files
+                ]
+                if video_logs:
+                    wandb.log(
+                        {f"validation_videos_len_{vid_len}": video_logs},
+                        step=self.step,
+                    )
 
             # After saving current length videos, release related tensors to reduce peak memory
             del videos, video_np, video_tensor  # type: ignore

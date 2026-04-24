@@ -4,3 +4,9 @@ longlive_models
 wan_models
 
 videos
+logs*
+vis
+wandb
+checkpoints
+
+.codex

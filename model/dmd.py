@@ -6,6 +6,7 @@ import torch
 import time
 
 from model.base import SelfForcingModel
+from pipeline.streaming_training import StreamingTrainingPipeline
 from utils.memory import log_gpu_memory
 import torch.distributed as dist
 from utils.debug_option import DEBUG, LOG_GPU_MEMORY
@@ -56,6 +57,24 @@ class DMD(SelfForcingModel):
             self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to(device)
         else:
             self.scheduler.alphas_cumprod = None
+
+    def _initialize_inference_pipeline(self):
+        if not getattr(self.args, "streaming_training", False):
+            return super()._initialize_inference_pipeline()
+
+        self.inference_pipeline = StreamingTrainingPipeline(
+            denoising_step_list=self.denoising_step_list,
+            scheduler=self.scheduler,
+            generator=self.generator,
+            num_frame_per_block=self.num_frame_per_block,
+            same_step_across_blocks=self.args.same_step_across_blocks,
+            last_step_only=self.args.last_step_only,
+            context_noise=self.args.context_noise,
+            local_attn_size=getattr(self.args, "model_kwargs", {}).get(
+                "local_attn_size", -1
+            ),
+            slice_last_frames=getattr(self.args, "slice_last_frames", 21),
+        )
 
     def _compute_kl_grad(
         self, noisy_image_or_video: torch.Tensor,

@@ -49,7 +49,23 @@ class StreamingTrainingModel:
         self.chunk_size = getattr(config, "streaming_chunk_size", 21)  # Fixed chunk size used for loss computation
         self.max_length = getattr(config, "streaming_max_length", 57)
         self.possible_max_length = getattr(config, "streaming_possible_max_length", None)
-        self.min_new_frame = getattr(config, "streaming_min_new_frame", 18)
+        self.fixed_overlap_latents = getattr(config, "streaming_fixed_overlap_latents", None)
+        if self.fixed_overlap_latents is not None:
+            self.fixed_overlap_latents = int(self.fixed_overlap_latents)
+            if not 0 <= self.fixed_overlap_latents < self.chunk_size:
+                raise ValueError(
+                    f"streaming_fixed_overlap_latents must be in [0, {self.chunk_size}), "
+                    f"got {self.fixed_overlap_latents}"
+                )
+            fixed_new_frame = self.chunk_size - self.fixed_overlap_latents
+            if fixed_new_frame % getattr(config, "num_frame_per_block", 3) != 0:
+                raise ValueError(
+                    f"chunk_size - streaming_fixed_overlap_latents must be divisible by num_frame_per_block; "
+                    f"got chunk_size={self.chunk_size}, overlap={self.fixed_overlap_latents}"
+                )
+            self.min_new_frame = fixed_new_frame
+        else:
+            self.min_new_frame = getattr(config, "streaming_min_new_frame", 18)
 
         # Get required components from the underlying model
         self.generator = base_model.generator
@@ -74,6 +90,7 @@ class StreamingTrainingModel:
             print(f"[StreamingTrain-Model] streamingTrainingModel initialized:")
             print(f"[StreamingTrain-Model] chunk_size={self.chunk_size}, max_length={self.max_length}")
             print(f"[StreamingTrain-Model] min_new_frame={self.min_new_frame}")
+            print(f"[StreamingTrain-Model] fixed_overlap_latents={self.fixed_overlap_latents}")
             print(f"[StreamingTrain-Model] base_model type: {type(self.base_model).__name__}")
 
     def _process_first_frame_encoding(self, frames: torch.Tensor) -> torch.Tensor:
@@ -438,25 +455,28 @@ class StreamingTrainingModel:
         # Check if previous_frames can be used for overlap and auto-compute overlap frame count
         previous_frames = self.state.get("previous_frames")
         if previous_frames is not None:
-            # Randomly select number of new frames (min=min_new_frame, max=chunk_size, step=3)
             max_new_frames = min(self.state["temp_max_length"] - current_length + 1, self.chunk_size)
-            possible_new_frames = list(range(self.min_new_frame, max_new_frames, 3))
-            
-            # Ensure all processes choose the same random value
-            if dist.is_initialized():
-                if dist.get_rank() == 0:
+            if self.fixed_overlap_latents is not None:
+                new_frames_to_generate = self.chunk_size - self.fixed_overlap_latents
+            else:
+                # Randomly select number of new frames (min=min_new_frame, max=chunk_size, step=3)
+                possible_new_frames = list(range(self.min_new_frame, max_new_frames, 3))
+
+                # Ensure all processes choose the same random value
+                if dist.is_initialized():
+                    if dist.get_rank() == 0:
+                        import random
+                        selected_idx = random.randint(0, len(possible_new_frames) - 1)
+                    else:
+                        selected_idx = 0
+                    selected_idx_tensor = torch.tensor(selected_idx, device=self.device, dtype=torch.int32)
+                    dist.broadcast(selected_idx_tensor, src=0)
+                    selected_idx = selected_idx_tensor.item()
+                else:
                     import random
                     selected_idx = random.randint(0, len(possible_new_frames) - 1)
-                else:
-                    selected_idx = 0
-                selected_idx_tensor = torch.tensor(selected_idx, device=self.device, dtype=torch.int32)
-                dist.broadcast(selected_idx_tensor, src=0)
-                selected_idx = selected_idx_tensor.item()
-            else:
-                import random
-                selected_idx = random.randint(0, len(possible_new_frames) - 1)
-            
-            new_frames_to_generate = possible_new_frames[selected_idx]
+
+                new_frames_to_generate = possible_new_frames[selected_idx]
 
             # Auto-compute required overlap frames to ensure the final chunk has 21 frames
             overlap_frames = self.chunk_size - new_frames_to_generate
