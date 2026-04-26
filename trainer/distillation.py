@@ -110,6 +110,16 @@ class Trainer:
             self.next_generator_step = int(self.step)
         else:
             self.next_generator_step = None
+        self.adaptive_debug_log = bool(getattr(config, "adaptive_debug_log", False))
+        if self.adaptive_debug_log and (
+            not dist.is_initialized() or dist.get_rank() == 0
+        ):
+            length_schedule = getattr(config, "streaming_max_length_schedule", None)
+            print(
+                f"[AdaptiveDiag] enabled "
+                f"generator_gap_choices={self.generator_update_gap_choices} "
+                f"length_schedule={OmegaConf.to_container(length_schedule, resolve=True) if length_schedule is not None else None}"
+            )
         
         # ------------------------------------- One Logger Setup ----------------------------------------------
         if self.use_one_logger and OneLoggerUtils is None and dist.get_rank() == 0:
@@ -766,7 +776,7 @@ class Trainer:
             raise ValueError(f"Invalid switch_mode: {getattr(self.config, 'switch_mode', 'fixed')}")
         return switch_idx
 
-    def _get_streaming_max_length_for_step(self):
+    def _get_streaming_max_length_stage_for_step(self):
         schedule = getattr(self.config, "streaming_max_length_schedule", None)
         if not schedule:
             return None
@@ -775,16 +785,34 @@ class Trainer:
         for stage in schedule:
             start_step = int(stage.get("start_step", 0))
             end_step = stage.get("end_step", None)
-            max_length = int(stage["max_length"])
             if end_step is None:
                 if current_step >= start_step:
-                    return max_length
+                    return {
+                        "start_step": start_step,
+                        "end_step": None,
+                        "max_length": int(stage["max_length"]),
+                    }
             else:
                 end_step = int(end_step)
                 if start_step <= current_step < end_step:
-                    return max_length
+                    return {
+                        "start_step": start_step,
+                        "end_step": end_step,
+                        "max_length": int(stage["max_length"]),
+                    }
 
-        return int(schedule[-1]["max_length"])
+        last_stage = schedule[-1]
+        return {
+            "start_step": int(last_stage.get("start_step", 0)),
+            "end_step": int(last_stage["end_step"]) if last_stage.get("end_step", None) is not None else None,
+            "max_length": int(last_stage["max_length"]),
+        }
+
+    def _get_streaming_max_length_for_step(self):
+        stage = self._get_streaming_max_length_stage_for_step()
+        if stage is None:
+            return None
+        return stage["max_length"]
 
     def _should_train_generator(self):
         if self.generator_update_gap_choices is None:
@@ -806,11 +834,21 @@ class Trainer:
         else:
             selected_gap = random.choice(self.generator_update_gap_choices)
 
-        self.next_generator_step = int(self.step) + selected_gap + 1
+        self.next_generator_step = int(self.step) + selected_gap
 
-        if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+        if not dist.is_initialized() or dist.get_rank() == 0:
             print(
-                f"[SeqTrain-Trainer] generator gap sampled={selected_gap}, "
+                f"[AdaptiveGap] step={self.step} "
+                f"sampled_gap={selected_gap} "
+                f"next_generator_step={self.next_generator_step}"
+            )
+
+        if (DEBUG or self.adaptive_debug_log) and (
+            not dist.is_initialized() or dist.get_rank() == 0
+        ):
+            print(
+                f"[AdaptiveDiag] step={self.step} "
+                f"sampled_gap={selected_gap} "
                 f"next_generator_step={self.next_generator_step}"
             )
 
@@ -1067,9 +1105,9 @@ class Trainer:
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
             log_gpu_memory(f"streaming Training: After text encoding", device=self.device, rank=dist.get_rank())
         
-        scheduled_max_length = self._get_streaming_max_length_for_step()
-        if scheduled_max_length is not None:
-            temp_max_length = scheduled_max_length
+        scheduled_stage = self._get_streaming_max_length_stage_for_step()
+        if scheduled_stage is not None:
+            temp_max_length = scheduled_stage["max_length"]
         elif self.streaming_model.possible_max_length is not None:
             # Ensure all processes choose the same length
             if dist.is_initialized():
@@ -1124,6 +1162,22 @@ class Trainer:
             switch_frame_index=switch_frame_index,
             temp_max_length=temp_max_length,
         )
+        if self.adaptive_debug_log and (
+            not dist.is_initialized() or dist.get_rank() == 0
+        ):
+            if scheduled_stage is not None:
+                end_step = scheduled_stage["end_step"]
+                end_label = "inf" if end_step is None else end_step
+                print(
+                    f"[AdaptiveDiag] step={self.step} "
+                    f"start_sequence max_length={temp_max_length} "
+                    f"schedule=[{scheduled_stage['start_step']},{end_label})"
+                )
+            else:
+                print(
+                    f"[AdaptiveDiag] step={self.step} "
+                    f"start_sequence max_length={temp_max_length}"
+                )
         
         self.streaming_active = True
         
@@ -1286,6 +1340,21 @@ class Trainer:
             while True:
                 # Check if we should train generator on this optimization step
                 TRAIN_GENERATOR = self._should_train_generator()
+                if self.adaptive_debug_log and (
+                    not dist.is_initialized() or dist.get_rank() == 0
+                ):
+                    current_length = 0
+                    temp_max_length = None
+                    if hasattr(self, "streaming_model") and self.streaming_model is not None:
+                        current_length = self.streaming_model.state.get("current_length", 0)
+                        temp_max_length = self.streaming_model.state.get("temp_max_length")
+                    print(
+                        f"[AdaptiveDiag] step={self.step} "
+                        f"train_generator={TRAIN_GENERATOR} "
+                        f"next_generator_step={self.next_generator_step} "
+                        f"current_length={current_length} "
+                        f"temp_max_length={temp_max_length}"
+                    )
                 if LOG_GPU_MEMORY:
                     log_gpu_memory(f"Before training", device=self.device, rank=dist.get_rank())
                 
